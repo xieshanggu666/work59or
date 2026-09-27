@@ -44,7 +44,12 @@ window.GameView = {
       this.error = "";
       this.loading = true;
       try {
-        const body = { event_key: this.crisis.event, choice_key: ck, target_id: this.crisis.target_id };
+        // 目标语义与后端事件定义一致：仅 single 事件回传受影响者，
+        // all（全体）事件一律不带 target_id，避免全体效果被窄化为单人
+        const body = { event_key: this.crisis.event, choice_key: ck };
+        if (this.crisis.target_mode === "single" && this.crisis.target_id != null) {
+          body.target_id = this.crisis.target_id;
+        }
         this.s = await Api.post(`/api/sessions/${this.sid}/resolve`, body);
         this.crisis = null;
       } catch (e) { this.error = e.message; }

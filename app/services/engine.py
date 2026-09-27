@@ -212,15 +212,21 @@ class BunkerEngine:
         event = self.rand.choice(crises)
         return self._apply_crisis(event)
 
-    def _apply_crisis(self, event):
-        # 选择一个居民受影响（若有可选目标）
+    def _random_alive_target(self):
         alive = [r for r in self.session.residents if r.alive]
-        target = self.rand.choice(alive) if alive else None
+        return self.rand.choice(alive) if alive else None
+
+    def _apply_crisis(self, event):
+        # 目标语义由事件定义决定：仅 single 事件挑选一名受影响者，
+        # all 事件不携带目标，前端据此决定是否回传 target_id
+        target_mode = event.get("target_mode", "all")
+        target = self._random_alive_target() if target_mode == "single" else None
         opts = event["choices"]
         return {
             "event": event["key"],
             "title": event["title"],
             "desc": event["desc"],
+            "target_mode": target_mode,
             "target_id": target.id if target else None,
             "target_name": target.name if target else None,
             "choices": [
@@ -264,29 +270,45 @@ class BunkerEngine:
         if not choice:
             raise BunkerEngineError("未知决策选项")
 
-        # 在应用任何效果前完成目标校验，保证失败时档案状态不发生部分变更
-        target = self._resolve_target(target_id)
+        # 目标语义以事件定义为准（服务端权威），与前端约定一致：
+        #   single —— 健康/士气效果只作用于受影响者本人；客户端应回传
+        #             target_id，缺失时随机选取一名存活者兜底
+        #   all    —— 健康/士气效果作用于全体存活者，客户端传入的
+        #             target_id 一律忽略，避免全体效果被窄化为单人
+        target_mode = event.get("target_mode", "all")
+        target = None
+        if target_mode == "single":
+            # 在应用任何效果前完成目标校验，保证失败时档案状态不发生部分变更
+            if target_id is not None:
+                target = self._resolve_target(target_id)
+            else:
+                target = self._random_alive_target()
 
         effects = choice.get("effects", {})
         detail_parts = []
 
-        # 资源效果
+        # 资源效果（始终为全局结算，与目标无关）
         for k, v in effects.get("resources", {}).items():
             self._add_resource(k, v)
             detail_parts.append(f"{RESOURCE_ZH.get(k,k)} {v:+.0f}")
-        # 健康/士气效果：显式目标只作用于本人，未提供目标才作用于全体存活者
-        if "health" in effects:
-            val = effects["health"]
-            pool = [target] if target is not None else [r for r in self.session.residents if r.alive]
-            for r in pool:
-                r.health = _clamp(r.health + val)
-            detail_parts.append(f"健康 {val:+.0f}")
-        if "morale" in effects:
-            val = effects["morale"]
-            pool = [target] if target is not None else [r for r in self.session.residents if r.alive]
-            for r in pool:
-                r.morale = _clamp(r.morale + val)
-            detail_parts.append(f"士气 {val:+.0f}")
+        # 健康/士气效果：按事件声明的目标语义结算，日志如实记录范围
+        if "health" in effects or "morale" in effects:
+            if target_mode == "single":
+                pool = [target] if target is not None else []
+                scope = target.name if target is not None else "无人"
+            else:
+                pool = [r for r in self.session.residents if r.alive]
+                scope = "全体"
+            if "health" in effects:
+                val = effects["health"]
+                for r in pool:
+                    r.health = _clamp(r.health + val)
+                detail_parts.append(f"{scope}健康 {val:+.0f}")
+            if "morale" in effects:
+                val = effects["morale"]
+                for r in pool:
+                    r.morale = _clamp(r.morale + val)
+                detail_parts.append(f"{scope}士气 {val:+.0f}")
         if "add_resident" in effects:
             self._add_resident(effects["add_resident"])
             detail_parts.append(f"加入新幸存者 {effects['add_resident']}")
@@ -395,11 +417,15 @@ FACILITY_ZH = {"farm": "穹顶菜园", "water": "净水器", "power": "发电机
 
 
 # ============ 危机事件池（决策树） ============
+# target_mode 为目标语义（前后端共同遵守）：
+#   "single" —— 健康/士气效果只作用于一名受影响者（触发时随机选定）
+#   "all"    —— 健康/士气效果作用于全体存活者
 CRISIS_POOL = [
     {
         "key": "radstorm",
         "title": "辐射风暴来袭",
         "desc": "一场强辐射风暴正在逼近地堡。派工程师抢修屏蔽层，或让所有人避难并停电。",
+        "target_mode": "all",
         "choices": [
             {
                 "key": "shield_repair",
@@ -419,6 +445,7 @@ CRISIS_POOL = [
         "key": "mutiny",
         "title": "地堡内讧",
         "desc": "因食物分配不公，一部分人情绪失控，要求重新分配口粮。",
+        "target_mode": "all",
         "choices": [
             {
                 "key": "double_ration",
@@ -438,6 +465,7 @@ CRISIS_POOL = [
         "key": "leak",
         "title": "氧气泄漏",
         "desc": "水培舱密封圈老化，氧气正在泄漏。",
+        "target_mode": "all",
         "choices": [
             {
                 "key": "emergency_repair",
@@ -457,6 +485,7 @@ CRISIS_POOL = [
         "key": "sick",
         "title": "疫病袭来",
         "desc": "一名幸存者出现不明高热，可能是污染引发的疾病。",
+        "target_mode": "single",
         "choices": [
             {
                 "key": "quarantine",
@@ -476,6 +505,7 @@ CRISIS_POOL = [
         "key": "raid",
         "title": "盗匪袭扰",
         "desc": "地堡外传来敲击声，一伙流民试图破门而入抢夺物资。",
+        "target_mode": "single",
         "choices": [
             {
                 "key": "defend",
@@ -495,6 +525,7 @@ CRISIS_POOL = [
         "key": "scavenge",
         "title": "发现物资舱",
         "desc": "侦察队在地堡深处发现一间废弃补给舱，但已部分损坏。",
+        "target_mode": "all",
         "choices": [
             {
                 "key": "crack_open",
@@ -514,6 +545,7 @@ CRISIS_POOL = [
         "key": "blizzard",
         "title": "暴雪封门",
         "desc": "极寒暴雪掩盖了地堡入口，通风与采能都受影响。",
+        "target_mode": "all",
         "choices": [
             {
                 "key": "burn_fuel",

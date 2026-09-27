@@ -223,6 +223,66 @@ def test_no_target_applies_to_all_alive(db):
     assert all(r.morale == 100 for r in gs.residents if r.alive)
 
 
+# ---- 危机目标语义：全体/单人由事件定义决定，前端回传不得改变结算范围 ----
+
+def test_all_event_ignores_echoed_target(db):
+    """全体事件：即使客户端无条件回传 target_id，士气效果仍作用于全体存活者。
+
+    回归场景：前端曾把触发时随机选出的 target_id 无条件回传，导致
+    内讧「加倍发放食物」的全体士气 +20 只作用于一名随机居民。
+    """
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    echoed = gs.residents[0].id
+    eng.resolve_crisis("mutiny", "double_ration", target_id=echoed)  # 士气 +20
+    assert all(r.morale == 100 for r in gs.residents if r.alive)
+
+
+def test_all_event_negative_morale_hits_everyone(db):
+    """全体事件的负面士气效果同样作用于全体（暴雪·集中避寒 士气 -10）。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    eng.resolve_crisis("blizzard", "huddle", target_id=gs.residents[0].id)
+    assert all(r.morale == 70 for r in gs.residents if r.alive)
+
+
+def test_single_event_without_target_falls_back_to_random(db):
+    """单人事件缺省目标时随机选取一名存活者，且仅其一人受影响。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())  # choice -> 序列首个
+    eng.resolve_crisis("raid", "defend")  # 健康 -8
+    hurt = [r for r in gs.residents if r.health == 82]
+    assert len(hurt) == 1
+    assert hurt[0] is gs.residents[0]
+
+
+def test_crisis_payload_target_semantics(db):
+    """危机载荷：全体事件不携带目标，单人事件携带受影响者与 target_mode。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    mutiny = next(e for e in CRISIS_POOL if e["key"] == "mutiny")
+    payload = eng._apply_crisis(mutiny)
+    assert payload["target_mode"] == "all"
+    assert payload["target_id"] is None
+    assert payload["target_name"] is None
+    sick = next(e for e in CRISIS_POOL if e["key"] == "sick")
+    payload = eng._apply_crisis(sick)
+    assert payload["target_mode"] == "single"
+    assert payload["target_id"] is not None
+    assert payload["target_name"] is not None
+
+
+def test_resolve_detail_reflects_settlement_scope(db):
+    """结算描述（即日志 detail）如实反映作用范围：全体 vs 具名居民。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    detail = eng.resolve_crisis("mutiny", "double_ration")
+    assert "全体士气 +20" in detail
+    target = gs.residents[1]
+    detail = eng.resolve_crisis("raid", "defend", target_id=target.id)
+    assert f"{target.name}健康 -8" in detail
+
+
 # ---- 结算边界：已结束档案拒绝一切状态变更 ----
 
 def test_actions_rejected_after_game_end(db):
