@@ -223,6 +223,123 @@ def test_no_target_applies_to_all_alive(db):
     assert all(r.morale == 100 for r in gs.residents if r.alive)
 
 
+# ---- 前后端目标语义统一：作用域由事件效果声明，而非客户端回传 ----
+
+def test_all_scope_crisis_carries_no_target(db):
+    """内讧（纯全体士气事件）生成待决策时不应随机出目标。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    event = next(e for e in CRISIS_POOL if e["key"] == "mutiny")
+    crisis = eng._apply_crisis(event)
+    assert crisis["needs_target"] is False
+    assert crisis["target_id"] is None
+    assert crisis["target_name"] is None
+    assert all(c["targeted"] is False for c in crisis["choices"])
+
+
+def test_single_scope_crisis_carries_target_and_flags(db):
+    """疫病存在单体决策，须随机目标；隔离=单人，全员消毒=全体。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    event = next(e for e in CRISIS_POOL if e["key"] == "sick")
+    crisis = eng._apply_crisis(event)
+    assert crisis["needs_target"] is True
+    assert crisis["target_id"] is not None
+    flags = {c["key"]: c["targeted"] for c in crisis["choices"]}
+    assert flags == {"quarantine": True, "public_health": False}
+
+
+def test_global_morale_ignores_client_target(db):
+    """回归：前端无条件回传随机目标时，全体士气决策仍须作用于全体存活者。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    random_target = gs.residents[0]
+    others = [r for r in gs.residents if r.id != random_target.id]
+    before = {r.id: r.morale for r in gs.residents}
+    # 内讧·严令镇压：士气 -15（全体），即便带了目标编号也应收窄
+    eng.resolve_crisis("mutiny", "suppress", target_id=random_target.id)
+    assert random_target.morale == before[random_target.id] - 15
+    for r in others:
+        assert r.morale == before[r.id] - 15
+
+
+def test_global_scope_ignores_even_foreign_target(db):
+    """全体效果不做目标校验：跨档案编号也不会让结算失败或作用于单人。"""
+    gs = make_session(db)
+    other = make_session(db)
+    foreign_id = other.residents[0].id
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    eng.resolve_crisis("mutiny", "suppress", target_id=foreign_id)
+    assert all(r.morale == 65 for r in gs.residents if r.alive)
+
+
+def test_single_scope_requires_target(db):
+    """单体决策缺少目标时报错，且不产生任何部分结算。"""
+    gs = make_session(db)
+    food_before = gs.resources[FOOD]
+    health_before = [r.health for r in gs.residents]
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    with pytest.raises(BunkerEngineError):
+        eng.resolve_crisis("sick", "quarantine", target_id=None)
+    assert gs.resources[FOOD] == food_before
+    assert [r.health for r in gs.residents] == health_before
+
+
+def test_single_vs_all_choice_scope_within_one_event(db):
+    """同一疫病事件：隔离只伤目标，全员消毒不动任何人健康。"""
+    gs = make_session(db)
+    target = gs.residents[0]
+
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    eng.resolve_crisis("sick", "quarantine", target_id=target.id)
+    assert target.health == 85
+    assert all(r.health == 90 for r in gs.residents if r.id != target.id)
+
+    # 全员消毒：资源效果，无健康伤害，target_id 被忽略
+    other = gs.residents[1]
+    eng.resolve_crisis("sick", "public_health", target_id=other.id)
+    assert other.health == 90
+    assert target.health == 85  # 上一步的目标不受本次影响
+
+
+def test_log_scope_matches_settlement(db):
+    """日志作用域标注必须与实际结算一致：单体写姓名，全体写全体。"""
+    from app.models import EventLog
+
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    target = gs.residents[1]
+    eng.resolve_crisis("raid", "defend", target_id=target.id)
+    eng.resolve_crisis("mutiny", "double_ration")
+    db.commit()
+
+    logs = db.query(EventLog).filter_by(session_id=gs.id).order_by(EventLog.id).all()
+    single_log = next(l for l in logs if "武装抵抗" in (l.detail or ""))
+    global_log = next(l for l in logs if "加倍发放食物" in (l.detail or ""))
+    assert target.name in single_log.detail
+    assert "全体" in global_log.detail
+
+
+def test_resource_change_persists_across_sessions(db):
+    """资源 JSON 变更须真正落库（重新打开会话仍可见）。"""
+    from app.core.database import SessionLocal
+    from app.models import GameSession as GS
+
+    gs = make_session(db)
+    sid = gs.id
+    before = gs.resources[FOOD]
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    eng.resolve_crisis("mutiny", "double_ration")  # 食物 -20
+    db.commit()
+
+    db2 = SessionLocal()
+    try:
+        reloaded = db2.get(GS, sid)
+        assert reloaded.resources[FOOD] == round(max(0.0, before - 20), 1)
+    finally:
+        db2.close()
+
+
 # ---- 结算边界：已结束档案拒绝一切状态变更 ----
 
 def test_actions_rejected_after_game_end(db):

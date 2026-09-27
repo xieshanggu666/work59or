@@ -162,11 +162,6 @@ def advance(sid: int, db: Session = Depends(get_db)):
     except BunkerEngineError as e:
         db.rollback()
         raise HTTPException(400, str(e))
-    # crisis 需带 target 显示名
-    if crisis and crisis.get("target_id"):
-        tgt = db.get(Resident, crisis["target_id"])
-        if tgt:
-            crisis["target_name"] = tgt.name
     return AdvanceResult(session=get_session_detail(gs, db), crisis=crisis)
 
 

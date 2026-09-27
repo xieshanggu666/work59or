@@ -66,7 +66,8 @@ class BunkerEngine:
         return self.session.resources or {k: 0 for k in RESOURCE_KEYS}
 
     def _set_resource(self, key, val):
-        res = self.session.resources or {k: 0 for k in RESOURCE_KEYS}
+        # 复制后整体回写，确保 JSON 列的变更被 SQLAlchemy 追踪并落库
+        res = dict(self.session.resources or {k: 0 for k in RESOURCE_KEYS})
         res[key] = round(max(0.0, val), 1)
         self.session.resources = res
 
@@ -74,8 +75,9 @@ class BunkerEngine:
         res = self.session.resources or {k: 0 for k in RESOURCE_KEYS}
         cur = res.get(key, 0.0)
         nxt = max(0.0, cur + delta)
-        res[key] = round(nxt, 1)
-        self.session.resources = res
+        new_res = dict(res)
+        new_res[key] = round(nxt, 1)
+        self.session.resources = new_res
         return nxt
 
     # ---- 设施 ----
@@ -205,6 +207,31 @@ class BunkerEngine:
         )
 
     # ---- 危机轮盘 ----
+
+    @staticmethod
+    def _effect_scope(effect):
+        """健康/士气效果的作用域：'single' 仅目标本人，'all' 全体存活者。
+
+        数字简写默认为全体；单体效果须显式声明
+        {"value": -5, "target": "single"}。
+        """
+        if isinstance(effect, dict):
+            return effect.get("target", "all")
+        return "all"
+
+    @staticmethod
+    def _effect_value(effect):
+        return effect["value"] if isinstance(effect, dict) else effect
+
+    def _event_needs_target(self, event):
+        """事件是否存在只作用于单个居民的决策；只有这类事件才随机目标。"""
+        for c in event["choices"]:
+            effects = c.get("effects", {})
+            for stat in ("health", "morale"):
+                if stat in effects and self._effect_scope(effects[stat]) == "single":
+                    return True
+        return False
+
     def _maybe_trigger_crisis(self):
         if self.rand.random() > CRISIS_DAY_CHANCE:
             return None
@@ -213,14 +240,17 @@ class BunkerEngine:
         return self._apply_crisis(event)
 
     def _apply_crisis(self, event):
-        # 选择一个居民受影响（若有可选目标）
+        # 仅当事件存在单体效果的决策时才抽取受影响居民；
+        # 全体事件不产生目标，前端也无从回传 target_id
+        needs_target = self._event_needs_target(event)
         alive = [r for r in self.session.residents if r.alive]
-        target = self.rand.choice(alive) if alive else None
+        target = self.rand.choice(alive) if needs_target and alive else None
         opts = event["choices"]
         return {
             "event": event["key"],
             "title": event["title"],
             "desc": event["desc"],
+            "needs_target": needs_target,
             "target_id": target.id if target else None,
             "target_name": target.name if target else None,
             "choices": [
@@ -228,25 +258,39 @@ class BunkerEngine:
                     "key": c["key"],
                     "label": c["label"],
                     "hint": c.get("hint", ""),
+                    "targeted": self._choice_targeted(c),
                 }
                 for c in opts
             ],
         }
+
+    @classmethod
+    def _choice_targeted(cls, choice):
+        """该决策是否含只作用于目标本人的健康/士气效果。"""
+        effects = choice.get("effects", {})
+        return any(
+            cls._effect_scope(effects[stat]) == "single"
+            for stat in ("health", "morale")
+            if stat in effects
+        )
 
     def _ensure_running(self):
         """结算边界：游戏结束后拒绝一切状态变更。"""
         if self.session.status != "running":
             raise BunkerEngineError("游戏已结束，无法执行该操作")
 
-    def _resolve_target(self, target_id):
+    def _resolve_target(self, target_id, required):
         """统一解析目标居民。
 
-        显式给出的目标必须归属当前档案且存活；跨档案编号、不存在或已故的
-        目标一律报错，绝不静默回退为全体，避免跨档案数据污染。
-        未提供目标（target_id 为 None）时返回 None，由调用方按全体处理。
+        - required=True（所选决策含单体效果）：必须显式给出目标，且目标归属
+          当前档案并存活；跨档案编号、不存在、已故或缺席一律报错。
+        - required=False（全体/资源类决策）：忽略客户端传入的目标，返回 None，
+          效果按全体结算，前端回传谁都不会把全体效果收窄成单体。
         """
-        if target_id is None:
+        if not required:
             return None
+        if target_id is None:
+            raise BunkerEngineError("该决策需要指定一名幸存者作为目标")
         target = next((r for r in self.session.residents if r.id == target_id), None)
         if target is None:
             raise BunkerEngineError("目标居民不存在或不属于当前档案")
@@ -264,37 +308,45 @@ class BunkerEngine:
         if not choice:
             raise BunkerEngineError("未知决策选项")
 
-        # 在应用任何效果前完成目标校验，保证失败时档案状态不发生部分变更
-        target = self._resolve_target(target_id)
-
         effects = choice.get("effects", {})
+
+        # 作用域由所选决策的效果声明决定，客户端传入的 target_id 不能改变它：
+        # 单体效果必须携带有效目标，全体效果一律忽略客户端目标
+        targeted = self._choice_targeted(choice)
+        # 在应用任何效果前完成目标校验，保证失败时档案状态不发生部分变更
+        target = self._resolve_target(target_id, required=targeted)
+
         detail_parts = []
 
         # 资源效果
         for k, v in effects.get("resources", {}).items():
             self._add_resource(k, v)
             detail_parts.append(f"{RESOURCE_ZH.get(k,k)} {v:+.0f}")
-        # 健康/士气效果：显式目标只作用于本人，未提供目标才作用于全体存活者
-        if "health" in effects:
-            val = effects["health"]
-            pool = [target] if target is not None else [r for r in self.session.residents if r.alive]
+        # 健康/士气效果：single 只作用于目标本人，all 作用于全体存活者
+        for stat, zh in (("health", "健康"), ("morale", "士气")):
+            if stat not in effects:
+                continue
+            spec = effects[stat]
+            val = self._effect_value(spec)
+            if self._effect_scope(spec) == "single":
+                pool = [target]
+                scope = f"仅{target.name}"
+            else:
+                pool = [r for r in self.session.residents if r.alive]
+                scope = "全体"
             for r in pool:
-                r.health = _clamp(r.health + val)
-            detail_parts.append(f"健康 {val:+.0f}")
-        if "morale" in effects:
-            val = effects["morale"]
-            pool = [target] if target is not None else [r for r in self.session.residents if r.alive]
-            for r in pool:
-                r.morale = _clamp(r.morale + val)
-            detail_parts.append(f"士气 {val:+.0f}")
+                setattr(r, stat, _clamp(getattr(r, stat) + val))
+            detail_parts.append(f"{zh} {val:+.0f}（{scope}）")
         if "add_resident" in effects:
             self._add_resident(effects["add_resident"])
             detail_parts.append(f"加入新幸存者 {effects['add_resident']}")
         if effects.get("trap"):
             detail_parts.append("（不良后果）")
 
+        # 日志与实际结算同一作用域：单体写名，全体写明“全体幸存者”
+        scope_zh = f"（目标：{target.name}）" if targeted else ""
         detail = "，".join(detail_parts) if detail_parts else "无显著变化"
-        self._log("crisis", event["title"], f"选择「{choice['label']}」：{detail}", decision=choice["label"])
+        self._log("crisis", event["title"], f"选择「{choice['label']}」{scope_zh}：{detail}", decision=choice["label"])
         self._check_end()
         return detail
 
@@ -462,7 +514,7 @@ CRISIS_POOL = [
                 "key": "quarantine",
                 "label": "隔离治疗",
                 "hint": "该居民卸下工作，健康缓慢回复",
-                "effects": {"resources": {"food": -4}, "health": -5},
+                "effects": {"resources": {"food": -4}, "health": {"value": -5, "target": "single"}},
             },
             {
                 "key": "public_health",
@@ -481,7 +533,7 @@ CRISIS_POOL = [
                 "key": "defend",
                 "label": "武装抵抗",
                 "hint": "能耗物资，可能有人受伤，但守住粮食",
-                "effects": {"resources": {"food": -2, "power": -4}, "health": -8},
+                "effects": {"resources": {"food": -2, "power": -4}, "health": {"value": -8, "target": "single"}},
             },
             {
                 "key": "bribe",

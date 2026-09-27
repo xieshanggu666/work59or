@@ -159,6 +159,8 @@ select {
 .choice:hover { border-color: var(--primary); background: var(--bg); }
 .choice strong { display: block; margin-bottom: 2px; }
 .choice .hint { color: var(--dim); font-size: 12px; }
+.scope-tag { float: right; font-size: 11px; line-height: 18px; padding: 0 8px; border-radius: 9px; color: var(--info); background: rgba(80,160,255,.12); }
+.scope-tag.solo { color: var(--warn, #ffb300); background: rgba(255,179,0,.14); }
 
 .ending { text-align: center; }
 .ending.win h2 { color: var(--primary); }

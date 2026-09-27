@@ -40,11 +40,18 @@ window.GameView = {
       } catch (e) { this.error = e.message; }
       finally { this.loading = false; }
     },
-    async resolve(ck) {
+    async resolve(c) {
       this.error = "";
       this.loading = true;
       try {
-        const body = { event_key: this.crisis.event, choice_key: ck, target_id: this.crisis.target_id };
+        // 目标语义以后端下发的 c.targeted 为准：
+        // 仅单体决策回传 target_id；全体决策显式传 null，
+        // 避免危机事件的随机目标被无条件带回、把全体效果收窄成一人
+        const body = {
+          event_key: this.crisis.event,
+          choice_key: c.key,
+          target_id: c.targeted ? this.crisis.target_id : null,
+        };
         this.s = await Api.post(`/api/sessions/${this.sid}/resolve`, body);
         this.crisis = null;
       } catch (e) { this.error = e.message; }
@@ -193,10 +200,13 @@ window.GameView = {
       <div class="crisis">
         <h2>⚡ {{ crisis.title }}</h2>
         <p class="crisis-desc">{{ crisis.desc }}</p>
-        <div v-if="crisis.target_name" class="crisis-tgt">受影响者：{{ crisis.target_name }}</div>
+        <div v-if="crisis.needs_target" class="crisis-tgt">
+          相关居民：{{ crisis.target_name }}<span class="dim">（仅标注「单人」的决策作用于本人，其余对全体生效）</span>
+        </div>
         <div class="choices">
-          <button v-for="c in crisis.choices" :key="c.key" class="choice" @click="resolve(c.key)">
+          <button v-for="c in crisis.choices" :key="c.key" class="choice" @click="resolve(c)">
             <strong>{{ c.label }}</strong>
+            <span class="scope-tag" :class="{ solo: c.targeted }">{{ c.targeted ? '单人' : '全体' }}</span>
             <span class="hint">{{ c.hint }}</span>
           </button>
         </div>
